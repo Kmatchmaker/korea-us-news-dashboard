@@ -1,0 +1,30 @@
+states:
+  GA: ["Georgia", "조지아", "GA"]
+  TN: ["Tennessee", "테네시", "TN"]
+  AL: ["Alabama", "앨라배마", "AL"]
+  SC: ["South Carolina", "사우스캐롤라이나", "SC"]
+  FL: ["Florida", "플로리다", "FL"]
+
+companies:
+  - 현대차
+  - 삼성
+  - SK
+  - LG
+  - 효성
+  - 포스코
+  - 한화
+
+korean_queries:
+  - '(조지아 OR Georgia OR 테네시 OR Tennessee OR 앨라배마 OR Alabama OR 플로리다 OR Florida)
+     (한국기업 OR 현대차 OR 삼성 OR SK OR LG)
+     (투자 OR 공장 OR 계약 OR 수주 OR 진출)'
+
+us_sources:
+  - name: Georgia Governor Press
+    url: https://gov.georgia.gov/press-releases
+
+  - name: Tennessee ECD Newsroom
+    url: https://tnecd.com/media/newsroom/
+
+  - name: Florida Commerce Press
+    url: https://floridajobs.org/news-center/DEO-Press
