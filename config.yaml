@@ -5,6 +5,12 @@ priority_companies:
   - LG
   - 한화
   - 고려아연
+  
+us_queries:
+  - '(Georgia OR Tennessee OR Alabama OR Florida OR "South Carolina" OR GA OR TN OR AL OR FL OR SC)
+     (Korean OR Korea OR "South Korean" OR "한국")
+     (investment OR invest OR plant OR factory OR expansion OR contract OR subsidiary OR announce OR "economic development")
+     (Hyundai OR SK OR LG OR Hanwha OR 고려아연 OR "Korean company" OR supplier)'
 
 states:
   GA: ["Georgia", "조지아", "GA"]
