@@ -1,3 +1,11 @@
+priority_companies:
+  - SK
+  - 현대차
+  - 기아
+  - LG
+  - 한화
+  - 고려아연
+
 states:
   GA: ["Georgia", "조지아", "GA"]
   TN: ["Tennessee", "테네시", "TN"]
