@@ -34,11 +34,16 @@ korean_queries:
      (투자 OR 공장 OR 계약 OR 수주 OR 진출)'
 
 us_sources:
-  - name: Georgia Governor Press
-    url: https://gov.georgia.gov/press-releases
+  - name: "GA Governor Press"
+    url: "https://gov.georgia.gov/press-releases"
+  - name: "Georgia.org Press Releases"
+    url: "https://georgia.org/press-releases"
+  - name: "TN ECD Newsroom"
+    url: "https://tnecd.com/media/newsroom/"
+  - name: "Made in Alabama News"
+    url: "https://www.madeinalabama.com/news/"
+  - name: "SC Commerce News"
+    url: "https://www.sccommerce.com/news"
+  - name: "FloridaCommerce Press"
+    url: "https://floridajobs.org/news-center/DEO-Press"
 
-  - name: Tennessee ECD Newsroom
-    url: https://tnecd.com/media/newsroom/
-
-  - name: Florida Commerce Press
-    url: https://floridajobs.org/news-center/DEO-Press
