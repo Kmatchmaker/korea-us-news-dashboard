@@ -1,12 +1,11 @@
 import re
 import hashlib
-from datetime import datetime, timezone
-from urllib.parse import quote, urljoin
+from urllib.parse import urljoin, urlparse
+from datetime import timezone
 
 import pandas as pd
 import requests
 import streamlit as st
-import feedparser
 import yaml
 from bs4 import BeautifulSoup
 from dateutil import parser as dateparser
@@ -16,14 +15,14 @@ from dateutil import parser as dateparser
 # SETTINGS
 # ============================
 CONFIG_PATH = "config.yaml"
-USER_AGENT = "Mozilla/5.0 (StreamlitNewsBoard/3.0)"
+USER_AGENT = "Mozilla/5.0 (StreamlitNewsBoard/USGovOnly/1.0)"
 HEADERS = {"User-Agent": USER_AGENT}
 
-DEFAULT_YEAR_FILTER = 2026  # 기본 2026년 (원하면 "전체"로 바꿔도 됨)
+CACHE_TTL_SEC = 60 * 20
+DEFAULT_YEAR_FILTER = 2026
 
-TOP5_MAX = 10               # TOP 섹션에서 최대 기업 수(요청: 최대 10개 기업 보이기)
-OTHER_MAX = 20              # 기타(신규 투자/진출/사업현황) 표시 개수
-CACHE_TTL_SEC = 60 * 20     # 20분 캐시
+TOP_COMPANY_MAX = 10        # 기업당 1개 최신/중요, 최대 10개 기업만
+OTHER_MAX = 20              # 나머지 업데이트 목록
 
 
 # ============================
@@ -35,21 +34,10 @@ def load_config():
 
 
 cfg = load_config()
-
-states_cfg = cfg.get("states", {})  # ex) GA: ["Georgia","조지아","GA"] 형태
+states_cfg = cfg.get("states", {})  # GA/TN/AL/SC/FL 등
 priority_companies = cfg.get("priority_companies", ["현대", "SK", "LG", "한화", "고려아연"])
-
 korean_queries = cfg.get("korean_queries", [])
-us_sources = cfg.get("us_sources", [])  # (선택) 주정부/기관 페이지들
-us_queries = cfg.get(
-    "us_queries",
-    [
-        '(Georgia OR Tennessee OR Alabama OR Florida OR "South Carolina" OR GA OR TN OR AL OR FL OR SC) '
-        '(Korean OR Korea OR "South Korean" OR "한국") '
-        '(investment OR invest OR plant OR factory OR expansion OR contract OR subsidiary OR announce OR "economic development") '
-        '(Hyundai OR SK OR LG OR Hanwha OR "Korean company" OR supplier)'
-    ],
-)
+us_sources = cfg.get("us_sources", [])
 
 
 # ============================
@@ -67,11 +55,6 @@ def strip_html(s: str) -> str:
     return norm_text(_html_tag.sub(" ", s or ""))
 
 
-def norm_query_for_url(q: str) -> str:
-    # 줄바꿈/다중공백 제거 후 URL 인코딩
-    return quote(norm_text(q))
-
-
 def safe_parse_date(s: str):
     if not s:
         return None
@@ -84,73 +67,79 @@ def safe_parse_date(s: str):
         return None
 
 
-def to_display_date(dt) -> str:
-    if not dt:
-        return ""
-    try:
-        return dt.astimezone(timezone.utc).strftime("%Y.%m.%d")
-    except Exception:
-        try:
-            return dt.strftime("%Y.%m.%d")
-        except Exception:
-            return ""
-
-
 def make_id(provider: str, title: str, url: str) -> str:
     raw = f"{provider}||{norm_text(title)}||{norm_text(url)}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 # ============================
-# STATE DETECTION
+# STATE DETECTION (오탐 줄이기)
+# - "SC" 같은 약어는 단어 경계로만 인식
+# - "Georgia"는 주정부 사이트에서만 나오게 할 거라 크게 문제 감소
 # ============================
-def detect_state(text: str) -> str:
-    t = norm_text(text).lower()
+STATE_ABBR = ["GA", "TN", "AL", "SC", "FL"]
+STATE_ABBR_RE = {abbr: re.compile(rf"(?<![A-Z0-9]){abbr}(?![A-Z0-9])") for abbr in STATE_ABBR}
+
+
+def detect_state_strict(text: str, source_url: str) -> str:
+    t = norm_text(text)
+
+    # 1) 긴 이름 먼저 (South Carolina / Tennessee 등)
+    tl = t.lower()
     for code, names in (states_cfg or {}).items():
-        # names can be list or dict(names=[...])
-        if isinstance(names, dict):
-            names_list = names.get("names", [])
-        else:
-            names_list = names
-        for n in names_list:
-            if norm_text(str(n)).lower() in t:
+        # config.yaml에서 names가 list라고 가정(이전 대화 기준)
+        for n in names:
+            n_norm = norm_text(str(n))
+            # 약어는 별도 처리
+            if n_norm.upper() in STATE_ABBR:
+                continue
+            if n_norm and n_norm.lower() in tl:
                 return code
+
+    # 2) 약어는 "단독 토큰"만
+    for abbr, rx in STATE_ABBR_RE.items():
+        if rx.search(t):
+            return abbr
+
+    # 3) 도메인 힌트(가능하면)
+    host = (urlparse(source_url).netloc or "").lower()
+    if "georgia" in host:
+        return "GA"
+    if "tnecd" in host or "tennessee" in host:
+        return "TN"
+    if "alabama" in host:
+        return "AL"
+    if "sccommerce" in host or "southcarolina" in host:
+        return "SC"
+    if "florida" in host:
+        return "FL"
+
     return "Global"
 
 
 # ============================
-# COMPANY DETECTION (NO MANUAL 100 LIST)
-# - TOP5는 확실히 캐치
-# - 그 외는 한국 기업명 패턴으로 자동 추출
+# COMPANY DETECTION
+# - TOP5는 alias로 묶고
+# - 그 외는 "기사에 나온 회사명"을 제목에서 뽑아 표시
 # ============================
-# TOP5 표기 통일(타이틀에서 다양한 표기를 한 이름으로 묶기)
 TOP5_ALIASES = {
-    "현대": ["현대", "현대차", "Hyundai", "HYUNDAI", "기아", "Kia", "KIA"],
-    "SK": ["SK", "SK온", "SK온", "SK hynix", "SK하이닉스", "하이닉스", "SK이노베이션", "SK Innovation"],
+    "현대": ["현대", "현대차", "Hyundai", "기아", "Kia"],
+    "SK": ["SK", "SK온", "SK hynix", "SK하이닉스", "하이닉스", "SK Innovation", "SK이노베이션"],
     "LG": ["LG", "LG에너지솔루션", "LG Energy Solution", "LG화학", "LG Chem"],
-    "한화": ["한화", "Hanwha", "HANWHA", "한화큐셀", "Qcells", "Q CELLS"],
-    "고려아연": ["고려아연", "Korea Zinc", "KoreaZinc", "KOREA ZINC"],
+    "한화": ["한화", "Hanwha", "한화큐셀", "Qcells", "Q CELLS"],
+    "고려아연": ["고려아연", "Korea Zinc", "KoreaZinc"],
 }
 
-# 자동 추출 패턴(너무 공격적이면 노이즈 생길 수 있어서 “기업명같은 것” 위주로)
-AUTO_PATTERNS = [
-    r"([가-힣A-Za-z]{2,20}전자)",
-    r"([가-힣A-Za-z]{2,20}중공업)",
-    r"([가-힣A-Za-z]{2,20}산업)",
-    r"([가-힣A-Za-z]{2,20}에너지)",
-    r"([가-힣A-Za-z]{2,20}화학)",
-    r"([가-힣A-Za-z]{2,20}건설)",
-    r"([가-힣A-Za-z]{2,20}모빌리티)",
-    r"([가-힣A-Za-z]{2,20}테크)",
-    r"([가-힣A-Za-z]{2,20}EPC)",
-    r"([가-힣A-Za-z]{2,20}오토)",
-    r"([가-힣A-Za-z]{2,20}금속)",
-    r"([가-힣A-Za-z]{2,20}소재)",
-    r"([가-힣A-Za-z]{2,20}전기)",
-]
+STOPWORDS = {
+    "미국", "한국", "조지아", "테네시", "앨라배마", "알라배마", "플로리다", "사우스캐롤라이나", "캐롤라이나",
+    "투자", "공장", "설립", "증설", "확장", "진출", "계약", "수주", "공급", "체결", "발표", "확정", "최대",
+    "주정부", "정부", "위원회", "뉴스", "보도자료", "경제개발", "카운티", "시", "주", "시장", "프로젝트",
+    "press", "release", "news", "governor", "department", "commerce", "economic", "development",
+    "georgia", "tennessee", "alabama", "florida", "carolina",
+}
 
 
-def detect_company_auto(title: str) -> str:
+def detect_company_from_title(title: str) -> str:
     t = norm_text(title)
 
     # 1) TOP5 alias 우선
@@ -159,60 +148,29 @@ def detect_company_auto(title: str) -> str:
             if a and a in t:
                 return canon
 
-    # 2) 자동 패턴
-    for p in AUTO_PATTERNS:
-        m = re.search(p, t)
-        if m:
-            name = m.group(1)
-            # 너무 흔한 단어/기관/지역이 잡히는 것 방지 (가벼운 안전장치)
-            if len(name) >= 2 and name not in ["한국", "미국", "조지아", "테네시", "플로리다"]:
-                return name
+    # 2) 제목 맨 앞 토큰(“OOO, …” / “OOO - …” / “OOO: …”)
+    m = re.match(r"^([가-힣A-Za-z0-9&/]+)", t)
+    if m:
+        cand = m.group(1)
+        if len(cand) >= 2 and cand.lower() not in STOPWORDS:
+            return cand
 
-    return "기타 한국기업"
+    # 3) 제목에서 회사명 후보 토큰 찾기(한글/영문/숫자 혼합 2~20자)
+    # 너무 일반적인 단어는 STOPWORDS로 걸러냄
+    tokens = re.findall(r"[가-힣A-Za-z0-9&/]{2,20}", t)
+    for tok in tokens:
+        if tok.lower() in STOPWORDS:
+            continue
+        # 회사명처럼 보이도록 “형태” 힌트(중공업/금속/오토/EPC 등) 있으면 우선
+        if re.search(r"(중공업|금속|오토|EPC|전자|에너지|화학|건설|모빌리티|테크|산업|소재)", tok):
+            return tok
+    # 형태 힌트가 없어도 첫 후보를 반환(너가 원한 “기사에 나온 기업명” 최대 반영)
+    for tok in tokens:
+        if tok.lower() in STOPWORDS:
+            continue
+        return tok
 
-
-# ============================
-# TAG / IMPORTANCE
-# ============================
-INVEST = ["투자", "공장", "설립", "증설", "진출", "확장", "신규", "라인", "캠퍼스"]
-DEAL = ["수주", "계약", "공급", "체결", "MOU", "협약", "파트너십"]
-CAPITAL = ["증자", "출자", "공시"]
-SALES = ["판매", "기록", "돌파", "매출", "실적"]
-GOV = ["정부", "범부처", "위원회", "MOU 이행", "전략투자"]
-
-
-def classify_tag(text: str) -> str:
-    if any(k in text for k in GOV):
-        return "[정책/정부]"
-    if any(k in text for k in INVEST):
-        return "[신규 투자]"
-    if any(k in text for k in DEAL):
-        return "[수주/계약]"
-    if any(k in text for k in CAPITAL):
-        return "[자본/공시]"
-    if any(k in text for k in SALES):
-        return "[실적/판매]"
-    return "[주요]"
-
-
-def importance_score(title: str, provider: str, company: str) -> int:
-    text = title
-    score = 0
-    if company in priority_companies:
-        score += 100
-    if any(k in text for k in GOV):
-        score += 40
-    if any(k in text for k in INVEST):
-        score += 35
-    if any(k in text for k in DEAL):
-        score += 25
-    if any(k in text for k in CAPITAL):
-        score += 20
-    if any(k in text for k in SALES):
-        score += 15
-    if provider == "KOREAN":
-        score += 5
-    return score
+    return "미확인기업"
 
 
 def icon_for_company(company: str) -> str:
@@ -220,66 +178,55 @@ def icon_for_company(company: str) -> str:
 
 
 # ============================
-# FETCH: Google News RSS (KR)
+# TAG / IMPORTANCE
 # ============================
-@st.cache_data(ttl=CACHE_TTL_SEC)
-def fetch_google_news_kr(queries: list[str], provider_label: str):
-    rows = []
-    for q in queries:
-        q_encoded = norm_query_for_url(q)
-        url = f"https://news.google.com/rss/search?q={q_encoded}&hl=ko&gl=KR&ceid=KR:ko"
+INVEST = ["invest", "investment", "plant", "facility", "expansion", "factory", "site", "build", "built", "construct"]
+INVEST_KO = ["투자", "공장", "설립", "증설", "확장", "진출", "신규"]
+DEAL = ["contract", "deal", "supply", "agreement", "award", "wins", "signed", "signs"]
+DEAL_KO = ["수주", "계약", "공급", "체결", "협약", "파트너십"]
+CAPITAL_KO = ["증자", "출자", "공시"]
+SALES_KO = ["판매", "기록", "돌파", "매출", "실적"]
 
-        feed = feedparser.parse(url)
-        for e in feed.entries[:60]:
-            title = norm_text(getattr(e, "title", ""))
-            link = norm_text(getattr(e, "link", ""))
-            published_raw = getattr(e, "published", "") or getattr(e, "updated", "")
-            dt = safe_parse_date(published_raw)
 
-            summary_html = getattr(e, "summary", None) or getattr(e, "description", None)
-            summary = strip_html(summary_html or "")
+def classify_tag(text: str) -> str:
+    tl = text.lower()
+    if any(k in text for k in INVEST_KO) or any(k in tl for k in INVEST):
+        return "[신규 투자]"
+    if any(k in text for k in DEAL_KO) or any(k in tl for k in DEAL):
+        return "[수주/계약]"
+    if any(k in text for k in CAPITAL_KO):
+        return "[자본/공시]"
+    if any(k in text for k in SALES_KO):
+        return "[실적/판매]"
+    return "[주요]"
 
-            if not title or not link:
-                continue
 
-            company = detect_company_auto(title)
-            state = detect_state(title)
-
-            tag = classify_tag(title)
-            core = summary if summary else title
-            core = (core[:180] + "…") if len(core) > 180 else core
-
-            rows.append(
-                {
-                    "provider": provider_label,
-                    "source": "Google News (KR)",
-                    "title": title,
-                    "url": link,
-                    "published_at": dt,
-                    "state": state,
-                    "company": company,
-                    "tag": tag,
-                    "core": core,
-                    "score": importance_score(title, provider_label, company),
-                }
-            )
-
-    # dedup
-    dedup = {}
-    for r in rows:
-        dedup[make_id(r["provider"], r["title"], r["url"])] = r
-    return list(dedup.values())
+def importance_score(title: str, company: str) -> int:
+    score = 0
+    if company in priority_companies:
+        score += 100
+    tag = classify_tag(title)
+    if tag == "[신규 투자]":
+        score += 35
+    elif tag == "[수주/계약]":
+        score += 25
+    elif tag == "[자본/공시]":
+        score += 20
+    elif tag == "[실적/판매]":
+        score += 15
+    else:
+        score += 5
+    return score
 
 
 # ============================
-# FETCH: US SOURCES (optional, HTML list)
-# - 주정부/기관 사이트는 구조가 제각각이라 "대략적 링크 리스트" 추출
-# - 제목만 가져오는 수준(요약/발행일은 사이트별 제각각)
+# FETCH: US GOV SOURCES ONLY (HTML list)
 # ============================
-def guess_items_from_page(html: str, base_url: str, max_items: int = 50):
+def guess_items_from_page(html: str, base_url: str, max_items: int = 60):
     soup = BeautifulSoup(html, "html.parser")
     items = []
 
+    # article 기반
     for art in soup.select("article"):
         a = art.select_one("a[href]")
         if not a:
@@ -297,6 +244,7 @@ def guess_items_from_page(html: str, base_url: str, max_items: int = 50):
 
         items.append((title, full_url, date_text))
 
+    # fallback: 링크 리스트
     if not items:
         for a in soup.select("a[href]"):
             title = norm_text(a.get_text(" "))
@@ -308,7 +256,7 @@ def guess_items_from_page(html: str, base_url: str, max_items: int = 50):
             full_url = urljoin(base_url, href)
             items.append((title, full_url, None))
 
-    # dedup + cap
+    # dedup
     seen = set()
     out = []
     for t, u, d in items:
@@ -323,216 +271,28 @@ def guess_items_from_page(html: str, base_url: str, max_items: int = 50):
 
 
 @st.cache_data(ttl=CACHE_TTL_SEC)
-def fetch_us_source_pages(sources: list[dict]):
+def fetch_us_gov_only(sources: list[dict]):
     rows = []
+
     for src in sources:
-        name = src.get("name", "US Source")
+        name = src.get("name", "US Government Source")
         url = src.get("url")
         if not url:
             continue
+
+        # (선택) 도메인 화이트리스트: source_url과 다른 도메인으로 튀는 링크는 제외
+        src_host = (urlparse(url).netloc or "").lower()
+
         try:
-            r = requests.get(url, headers=HEADERS, timeout=20)
+            r = requests.get(url, headers=HEADERS, timeout=25)
             r.raise_for_status()
-            items = guess_items_from_page(r.text, url, max_items=40)
+            items = guess_items_from_page(r.text, url, max_items=60)
         except Exception:
             continue
 
         for title, link, date_text in items:
-            dt = safe_parse_date(date_text) if date_text else None
+            link_host = (urlparse(link).netloc or "").lower()
 
-            company = detect_company_auto(title)
-            state = detect_state(title)
-
-            tag = classify_tag(title)
-            core = title
-            core = (core[:180] + "…") if len(core) > 180 else core
-
-            rows.append(
-                {
-                    "provider": "US_PAGE",
-                    "source": name,
-                    "title": title,
-                    "url": link,
-                    "published_at": dt,
-                    "state": state,
-                    "company": company,
-                    "tag": tag,
-                    "core": core,
-                    "score": importance_score(title, "US", company),
-                }
-            )
-
-    dedup = {}
-    for r in rows:
-        dedup[make_id(r["provider"], r["title"], r["url"])] = r
-    return list(dedup.values())
-
-
-# ============================
-# BUILD DISPLAY TABLES
-# ============================
-def build_df(rows: list[dict]) -> pd.DataFrame:
-    if not rows:
-        return pd.DataFrame(columns=["주(State)", "기업명", "뉴스 발행일", "핵심 내용", "원문 확인"])
-
-    df = pd.DataFrame(rows)
-
-    # datetime normalize for sorting
-    df["_when"] = pd.to_datetime(df["published_at"], errors="coerce", utc=True)
-    now = pd.Timestamp.now(tz="UTC")
-    df["_when"] = df["_when"].fillna(now - pd.Timedelta(days=3650))
-
-    df["_score"] = df["score"].fillna(0).astype(int)
-
-    df["뉴스 발행일"] = df["_when"].dt.strftime("%Y.%m.%d")
-    df["주(State)"] = df["state"]
-    df["기업명"] = df["company"].apply(lambda c: f"{icon_for_company(c)} {c}")
-    df["핵심 내용"] = df.apply(lambda r: f"{r['tag']} {r['core']}", axis=1)
-
-    # 링크는 LinkColumn으로 표시할 거라 URL 그대로 둠
-    df["원문 확인"] = df["url"]
-
-    # 최신/중요도 정렬
-    df = df.sort_values(by=["_when", "_score"], ascending=[False, False])
-    return df
-
-
-def apply_year_filter(df: pd.DataFrame, year_filter):
-    if df.empty:
-        return df
-    if year_filter == "전체":
-        return df
-    y = str(int(year_filter))
-    return df[df["뉴스 발행일"].str.startswith(y)]
-
-
-def pick_top_per_company(df: pd.DataFrame, top_companies: list[str]) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    # 표시명(👑 현대) → 실제 비교는 원본 company로 해야 하므로 원본 열이 필요
-    # 여기서는 "company" 원본이 df에 없으니, 표시명에서 제거
-    def strip_icon(name: str) -> str:
-        return norm_text(name.replace("👑", "").replace("💎", ""))
-
-    df2 = df.copy()
-    df2["_company_plain"] = df2["기업명"].apply(strip_icon)
-
-    subset = df2[df2["_company_plain"].isin(top_companies)].copy()
-    if subset.empty:
-        return subset.drop(columns=["_company_plain"], errors="ignore")
-
-    # 기업당 1개
-    subset = subset.groupby("_company_plain", as_index=False).head(1)
-
-    # 순서: top_companies 순서대로
-    order_map = {c: i for i, c in enumerate(top_companies)}
-    subset["_order"] = subset["_company_plain"].map(lambda x: order_map.get(x, 9999))
-
-    subset = subset.sort_values(by=["_order"], ascending=True)
-    subset = subset.head(TOP5_MAX)
-
-    return subset.drop(columns=["_company_plain", "_order"], errors="ignore")
-
-
-def pick_other_updates(df: pd.DataFrame, top_companies: list[str], n: int) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    def strip_icon(name: str) -> str:
-        return norm_text(name.replace("👑", "").replace("💎", ""))
-
-    df2 = df.copy()
-    df2["_company_plain"] = df2["기업명"].apply(strip_icon)
-
-    other = df2[~df2["_company_plain"].isin(top_companies)].copy()
-    if other.empty:
-        return other.drop(columns=["_company_plain"], errors="ignore")
-
-    # "기타 한국기업"도 최신 투자/진출 기사면 가치가 있으니 포함
-    other = other.head(n)
-    return other.drop(columns=["_company_plain"], errors="ignore")
-
-
-# ============================
-# UI
-# ============================
-st.set_page_config(page_title="미국 진출 한국기업 뉴스 상황판", layout="wide")
-st.title("📰 미국 진출 한국기업 뉴스 상황판")
-st.caption("TOP5(현대/SK/LG/한화/고려아연)는 기업당 1개, 그 외는 자동으로 기업명을 추출해 최신 업데이트를 보여줍니다.")
-
-with st.sidebar:
-    st.subheader("필터")
-    year_filter = st.selectbox("발행 연도", [DEFAULT_YEAR_FILTER, 2025, 2024, "전체"], index=0)
-    st.markdown("---")
-    st.write("TOP5(고정 표시):")
-    st.code(", ".join(priority_companies))
-    if st.button("🔄 캐시 새로고침(강제 재수집)"):
-        st.cache_data.clear()
-        st.rerun()
-
-tab1, tab2 = st.tabs(["🇰🇷 한국어 뉴스", "🇺🇸 미국(주정부/현지) 뉴스"])
-
-# ---- Tab 1: Korean news (KR)
-with tab1:
-    st.subheader("⭐ TOP 기업 최신 (기업당 1개)")
-    rows_kr = fetch_google_news_kr(korean_queries, provider_label="KOREAN")
-    df_kr = apply_year_filter(build_df(rows_kr), year_filter)
-
-    top_kr = pick_top_per_company(df_kr, priority_companies)
-    if top_kr.empty:
-        st.info("TOP 기업 뉴스를 찾지 못했습니다. korean_queries를 확장해보세요.")
-    else:
-        st.dataframe(
-            top_kr[["주(State)", "기업명", "뉴스 발행일", "핵심 내용", "원문 확인"]],
-            use_container_width=True,
-            hide_index=True,
-            column_config={"원문 확인": st.column_config.LinkColumn("원문 확인")},
-        )
-
-    st.subheader("🆕 신규 투자·진출 및 미국 사업 현황 (자동 추출 기업)")
-    other_kr = pick_other_updates(df_kr, priority_companies, OTHER_MAX)
-    if other_kr.empty:
-        st.info("추가 업데이트가 없습니다.")
-    else:
-        st.dataframe(
-            other_kr[["주(State)", "기업명", "뉴스 발행일", "핵심 내용", "원문 확인"]],
-            use_container_width=True,
-            hide_index=True,
-            column_config={"원문 확인": st.column_config.LinkColumn("원문 확인")},
-        )
-
-# ---- Tab 2: US news (mix: Google News query + optional state pages)
-with tab2:
-    st.subheader("⭐ TOP 기업 최신 (기업당 1개)")
-    rows_us_gn = fetch_google_news_kr(us_queries, provider_label="US_GNEWS")
-    rows_us_pages = fetch_us_source_pages(us_sources) if us_sources else []
-    rows_us_all = rows_us_gn + rows_us_pages
-
-    df_us = apply_year_filter(build_df(rows_us_all), year_filter)
-
-    top_us = pick_top_per_company(df_us, priority_companies)
-    if top_us.empty:
-        st.info("TOP 기업 미국 뉴스가 없습니다. us_queries / us_sources를 확장해보세요.")
-    else:
-        st.dataframe(
-            top_us[["주(State)", "기업명", "뉴스 발행일", "핵심 내용", "원문 확인"]],
-            use_container_width=True,
-            hide_index=True,
-            column_config={"원문 확인": st.column_config.LinkColumn("원문 확인")},
-        )
-
-    st.subheader("🆕 신규 투자·진출 및 미국 사업 현황 (자동 추출 기업)")
-    other_us = pick_other_updates(df_us, priority_companies, OTHER_MAX)
-    if other_us.empty:
-        st.info("추가 업데이트가 없습니다.")
-    else:
-        st.dataframe(
-            other_us[["주(State)", "기업명", "뉴스 발행일", "핵심 내용", "원문 확인"]],
-            use_container_width=True,
-            hide_index=True,
-            column_config={"원문 확인": st.column_config.LinkColumn("원문 확인")},
-        )
-
-st.markdown("---")
-st.write("✅ 기업명은 TOP5는 고정, 나머지는 기사 제목에서 자동 추출합니다. (기업명 100개 입력할 필요 없음)")
+            # 다른 도메인으로 튀는 링크(광고/외부뉴스) 제거 (오탐 줄이기)
+            if src_host and link_host and (src_host not in link_host):
+                # 단, georgia.org 같은 경우 press
