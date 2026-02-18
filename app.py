@@ -222,41 +222,100 @@ def importance_score(title: str, company: str) -> int:
 # ============================
 # FETCH: US GOV SOURCES ONLY (HTML list)
 # ============================
-def guess_items_from_page(html: str, base_url: str, max_items: int = 60):
+def guess_items_from_page(html: str, base_url: str, max_items: int = 80):
     soup = BeautifulSoup(html, "html.parser")
+    host = (urlparse(base_url).netloc or "").lower()
+
     items = []
 
-    # article 기반
-    for art in soup.select("article"):
-        a = art.select_one("a[href]")
-        if not a:
-            continue
-        title = norm_text(a.get_text(" "))
-        href = norm_text(a.get("href", ""))
-        if not title or not href:
-            continue
-        full_url = urljoin(base_url, href)
+    # -----------------------------
+    # (A) GA Governor Press: /press-releases/YYYY-MM-DD/slug 패턴만 정확히 추출
+    # -----------------------------
+    if "gov.georgia.gov" in host:
+        for a in soup.select('a[href*="/press-releases/"]'):
+            href = a.get("href", "")
+            full_url = urljoin(base_url, href)
+            if not re.search(r"/press-releases/\d{4}-\d{2}-\d{2}/", full_url):
+                continue
 
-        date_text = None
-        time_tag = art.select_one("time")
-        if time_tag:
-            date_text = norm_text(time_tag.get("datetime") or time_tag.get_text(" "))
+            text = norm_text(a.get_text(" "))
+            if not text:
+                continue
 
-        items.append((title, full_url, date_text))
+            # 예: "Gov. Kemp: ... February 04, 2026" 같은 한 줄에서 제목/날짜 분리
+            m = re.search(r"(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}", text)
+            date_text = m.group(0) if m else None
+            title = text.replace(date_text, "").strip() if date_text else text
 
-    # fallback: 링크 리스트
-    if not items:
-        for a in soup.select("a[href]"):
+            items.append((title, full_url, date_text))
+
+    # -----------------------------
+    # (B) Georgia.org Press Releases: "Read More" 링크 or 제목 블록에서 press-releases 링크 추출
+    # -----------------------------
+    elif "georgia.org" in host:
+        # /press-releases 내부 링크만
+        for a in soup.select('a[href*="/press-releases"]'):
+            href = a.get("href", "")
+            full_url = urljoin(base_url, href)
+
+            # georgia.org는 목록 항목이 "### Feb 4, 2026 ... Read More" 형태라
+            # 날짜가 텍스트에 들어가 있거나, 같은 카드 안에 있음
+            text = norm_text(a.get_text(" "))
+            if not text:
+                continue
+
+            # "Read More"만 잡히는 경우가 있으니, 주변(부모)에서 제목을 끌어올림
+            if text.lower() in {"read more", "read more\u00a0"}:
+                parent_text = norm_text(a.find_parent().get_text(" ")) if a.find_parent() else ""
+                text = parent_text if parent_text else text
+
+            m = re.search(r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4}", text)
+            date_text = m.group(0) if m else None
+            title = text.replace(date_text, "").replace("Read More", "").strip()
+
+            # 너무 짧은 잡음 제외
+            if len(title) < 12:
+                continue
+
+            items.append((title, full_url, date_text))
+
+    # -----------------------------
+    # (C) Generic fallback: article->a 우선, 없으면 의미있는 a만
+    # -----------------------------
+    else:
+        for art in soup.select("article"):
+            a = art.select_one("a[href]")
+            if not a:
+                continue
             title = norm_text(a.get_text(" "))
             href = norm_text(a.get("href", ""))
             if not title or not href:
                 continue
-            if len(title) < 12:
-                continue
             full_url = urljoin(base_url, href)
-            items.append((title, full_url, None))
 
-    # dedup
+            date_text = None
+            time_tag = art.select_one("time")
+            if time_tag:
+                date_text = norm_text(time_tag.get("datetime") or time_tag.get_text(" "))
+
+            items.append((title, full_url, date_text))
+
+        if not items:
+            # "메인 콘텐츠" 위주로만 훑기 (메뉴/푸터 잡음 줄임)
+            main = soup.select_one("main") or soup
+            for a in main.select("a[href]"):
+                title = norm_text(a.get_text(" "))
+                href = norm_text(a.get("href", ""))
+                if not title or not href:
+                    continue
+                if len(title) < 12:
+                    continue
+                full_url = urljoin(base_url, href)
+                items.append((title, full_url, None))
+
+    # -----------------------------
+    # Dedup + cap
+    # -----------------------------
     seen = set()
     out = []
     for t, u, d in items:
@@ -267,8 +326,8 @@ def guess_items_from_page(html: str, base_url: str, max_items: int = 60):
         out.append((t, u, d))
         if len(out) >= max_items:
             break
-    return out
 
+    return out
 
 @st.cache_data(ttl=CACHE_TTL_SEC)
 def fetch_us_gov_only(sources: list[dict]):
